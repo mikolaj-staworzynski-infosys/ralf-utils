@@ -133,7 +133,8 @@ void LIBRALF_NS::setLogHandler(LogHandler handler)
 }
 
 ///< Stores the default minimum log priority
-static LogPriority g_defaultMinLogPrio = LogPriority::Warning;
+//static LogPriority g_defaultMinLogPrio = LogPriority::Warning;
+static LogPriority g_defaultMinLogPrio = LogPriority::Info;
 
 ///< Stores the log priority for individual log tags
 static std::map<std::string, LogPriority> g_tagMinLogPrio = {};

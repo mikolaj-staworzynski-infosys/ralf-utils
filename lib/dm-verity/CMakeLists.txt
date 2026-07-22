@@ -30,6 +30,7 @@ if (UNIX AND NOT APPLE)
             DmVerityMount.cpp
             DevMapper.cpp
             UDevNotifySemaphore.cpp
+            DmVerityUtils.cpp
     )
 endif ()
 

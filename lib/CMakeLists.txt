@@ -44,6 +44,7 @@ if (RALF_UTILS_ENABLE_OCI)
     add_compile_definitions(ENABLE_OCI=1)
     add_subdirectory(oci)
     add_subdirectory(dm-verity)
+    add_subdirectory(luks)
 endif ()
 
 if (RALF_UTILS_ENABLE_ARCHIVE)
@@ -67,9 +68,14 @@ set(libralf_COMPONENTS
 
         $<$<BOOL:${RALF_UTILS_ENABLE_OCI}>:$<TARGET_OBJECTS:libralf-oci>>
         $<$<BOOL:${RALF_UTILS_ENABLE_OCI}>:$<TARGET_OBJECTS:libralf-dm-verity>>
+        $<$<BOOL:${RALF_UTILS_ENABLE_OCI}>:$<TARGET_OBJECTS:libralf-luks>>
 
         $<$<BOOL:${RALF_UTILS_ENABLE_EROFS}>:$<TARGET_OBJECTS:libralf-erofs>>
 )
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(CRYPTSETUP REQUIRED IMPORTED_TARGET libcryptsetup)
+pkg_check_modules(UUID REQUIRED IMPORTED_TARGET uuid)
 
 set(libralf_LIBDEPS
         LibXml2::LibXml2
@@ -77,6 +83,8 @@ set(libralf_LIBDEPS
 
         $<$<BOOL:${RALF_UTILS_ENABLE_EROFS}>:lz4::lz4>
         $<$<BOOL:${RALF_UTILS_ENABLE_W3C_WIDGET}>:LibArchive::LibArchive>
+        PkgConfig::CRYPTSETUP
+        PkgConfig::UUID
 )
 
 if (BUILD_SHARED_LIBS)

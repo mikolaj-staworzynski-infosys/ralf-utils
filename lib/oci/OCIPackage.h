@@ -37,6 +37,7 @@ class OCIDescriptor;
 namespace entos::ralf::dmverity
 {
     class IDmVerityMounter;
+    class ILuksMounter;
 }
 
 // -------------------------------------------------------------------------
@@ -59,6 +60,7 @@ public:
 public:
     OCIPackage(std::shared_ptr<IOCIBackingStore> &&backingStore,
                std::shared_ptr<entos::ralf::dmverity::IDmVerityMounter> &&dmVerityMounter,
+               std::shared_ptr<entos::ralf::dmverity::ILuksMounter> &&luksMounter,
                LIBRALF_NS::Error *_Nullable error);
 
     ~OCIPackage() final;
@@ -130,8 +132,27 @@ private:
         uint64_t hashesOffset = 0;
     };
 
+    struct CryptoAnnotations
+    {
+        std::string jwe;
+        std::string type;
+        int keySize;
+    };
+
+    struct CryptoVerityAnnotations
+    {
+        CryptoAnnotations crypto;
+        DmVerityAnnotations verity;
+    };
+
     static LIBRALF_NS::Result<DmVerityAnnotations>
     getDmVerityAnnotations(const std::shared_ptr<const OCIDescriptor> &descriptor);
+
+    static LIBRALF_NS::Result<CryptoAnnotations>
+    getCryptoAnnotations(const std::shared_ptr<const OCIDescriptor> &descriptor);
+
+    static LIBRALF_NS::Result<CryptoVerityAnnotations>
+    getCryptoVerityAnnotations(const std::shared_ptr<const OCIDescriptor> &descriptor);
 
 private:
     friend class OCIArchiveImageLayerReader;
@@ -139,6 +160,7 @@ private:
     std::shared_ptr<IOCIBackingStore> m_backingStore;
 
     std::shared_ptr<entos::ralf::dmverity::IDmVerityMounter> m_dmVerityMounter;
+    std::shared_ptr<entos::ralf::dmverity::ILuksMounter> m_luksMounter;
 
     mutable std::atomic<ssize_t> m_unpackedSize = -1;
 

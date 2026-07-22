@@ -26,11 +26,18 @@
 #define PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_TAR_GZIP PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_TAR "+gzip"
 #define PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_TAR_ZSTD PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_TAR "+zstd"
 #define PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_EROFS PACKAGE_IMAGE_MEDIA_TYPE_PREFIX "erofs+dmverity"
+#define PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_EROFS_ENCRYPTED PACKAGE_IMAGE_MEDIA_TYPE_PREFIX "erofs+dmverity+encrypted"
 
 /// The annotations keys for the dm-verity metadata
 #define PACKAGE_ANNOTATION_DMVERITY_ROOTHASH "org.rdk.package.content.dmverity.roothash"
 #define PACKAGE_ANNOTATION_DMVERITY_OFFSET "org.rdk.package.content.dmverity.offset"
 #define PACKAGE_ANNOTATION_DMVERITY_SALT "org.rdk.package.content.dmverity.salt"
+
+/// The annotations keys for the encryption metadata
+#define PACKAGE_ANNOTATION_CRYPT_CIPHER "org.opencontainers.image.dmcrypt.cipher"
+#define PACKAGE_ANNOTATION_CRYPT_KEYSIZE "org.opencontainers.image.dmcrypt.keysize"
+#define PACKAGE_ANNOTATION_CRYPT_TYPE "org.opencontainers.image.dmcrypt.type"
+#define PACKAGE_ANNOTATION_CRYPT_JWE_KEY "org.opencontainers.image.enc.keys.jwe"
 
 /// The mediaType for our package signature layer
 #define PACKAGE_SIGNATURE_MEDIA_TYPE "application/vnd.dev.cosign.simplesigning.v1+json"

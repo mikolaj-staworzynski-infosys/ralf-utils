@@ -32,8 +32,10 @@
 #include "core/LogMacros.h"
 #include "core/PackageAuxMetaDataImpl.h"
 #include "dm-verity/IDmVerityMounter.h"
+#include "luks/ILuksMounter.h"
 #if defined(__linux__)
 #    include "dm-verity/DmVerityMounterLinux.h"
+#    include "luks/LuksMounterLinux.h"
 #endif
 
 #include <nlohmann/json.hpp>
@@ -125,14 +127,17 @@ std::unique_ptr<OCIPackage> OCIPackage::open(std::shared_ptr<IOCIBackingStore> b
                                              const std::optional<LIBRALF_NS::VerificationBundle> &bundle,
                                              LIBRALF_NS::Package::OpenFlags flags, LIBRALF_NS::Error *_Nullable error)
 {
-    // Create dm-verity mounter if on Linux
+    // Create mount handlers if on Linux.
     std::shared_ptr<IDmVerityMounter> dmVerityMounter;
+    std::shared_ptr<ILuksMounter> luksMounter;
 #if defined(__linux__)
     dmVerityMounter = std::make_shared<DmVerityMounterLinux>();
+    luksMounter = std::make_shared<LuksMounterLinux>();
 #endif
 
     // Create a wrapper on the package
-    auto package = std::make_unique<OCIPackage>(std::move(backingStore), std::move(dmVerityMounter), error);
+    auto package = std::make_unique<OCIPackage>(std::move(backingStore), std::move(dmVerityMounter),
+                                                std::move(luksMounter), error);
     if (!package || !package->isValid())
         return nullptr;
 
@@ -162,9 +167,11 @@ std::unique_ptr<OCIPackage> OCIPackage::open(std::shared_ptr<IOCIBackingStore> b
     the size of the package.
 */
 OCIPackage::OCIPackage(std::shared_ptr<IOCIBackingStore> &&backingStore,
-                       std::shared_ptr<IDmVerityMounter> &&dmVerityMounter, LIBRALF_NS::Error *_Nullable error)
+                       std::shared_ptr<IDmVerityMounter> &&dmVerityMounter,
+                       std::shared_ptr<ILuksMounter> &&luksMounter, LIBRALF_NS::Error *_Nullable error)
     : m_backingStore(std::move(backingStore))
     , m_dmVerityMounter(std::move(dmVerityMounter))
+    , m_luksMounter(std::move(luksMounter))
 {
     // Build the basic tree of contents in the package
     auto result = buildContentsTree();
@@ -807,9 +814,12 @@ bool OCIPackage::isMountable() const
     if (!m_backingStore->supportsMountableFiles())
         return false;
 
-    // If the image layer is an EROFS image then we can mount it ...
-    if (m_packageImageDescriptor->mediaType() != PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_EROFS)
+    const auto &mediaType = m_packageImageDescriptor->mediaType();
+    if ((mediaType != PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_EROFS) &&
+        (mediaType != PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_EROFS_ENCRYPTED))
+    {
         return false;
+    }
 
     // ... as long as the image layer data is not compressed and aligned
     static const std::filesystem::path blobsPath = "blobs/sha256";
@@ -975,8 +985,12 @@ Result<> OCIPackage::calcAndCheckBlobDigest(const OCIDescriptor &descriptor)
 Result<OCIPackage::DmVerityAnnotations>
 OCIPackage::getDmVerityAnnotations(const std::shared_ptr<const OCIDescriptor> &descriptor)
 {
-    // Check the media type is the expected one for an EROFS image layer
-    if (!descriptor || (descriptor->mediaType() != PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_EROFS))
+    // Check the media type is the expected one for an EROFS image layer.
+    // The dm-verity descriptor is the base integrity layer and the LUKS-over-dm-verity variant is detected as an
+    // independent media type that still carries the same dm-verity annotations.
+    if (!descriptor ||
+        ((descriptor->mediaType() != PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_EROFS) &&
+         (descriptor->mediaType() != PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_EROFS_ENCRYPTED)))
     {
         return Error(ErrorCode::PackageMountInvalid, "Package image layer is doesn't have erfos+dmverity media type");
     }
@@ -1026,6 +1040,59 @@ OCIPackage::getDmVerityAnnotations(const std::shared_ptr<const OCIDescriptor> &d
     return details;
 }
 
+Result<OCIPackage::CryptoAnnotations>
+OCIPackage::getCryptoAnnotations(const std::shared_ptr<const OCIDescriptor> &descriptor)
+{
+    CryptoAnnotations details;
+    details.keySize = 512;
+    details.type = "luks2";
+    details.jwe = "";
+    for (const auto &[key, value] : descriptor->annotations())
+    {
+        if (key == PACKAGE_ANNOTATION_CRYPT_TYPE)
+        {
+            details.type = value;
+        }
+        else if (key == PACKAGE_ANNOTATION_CRYPT_KEYSIZE)
+        {
+            details.keySize = std::strtoul(value.c_str(), nullptr, 10);
+        }
+        else if (key == PACKAGE_ANNOTATION_CRYPT_JWE_KEY)
+        {
+            details.jwe = value;
+        }
+    }
+
+    // A JWE block is completely mandatory for an encrypted image layout path
+    if (descriptor->mediaType() == PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_EROFS_ENCRYPTED && details.jwe.empty())
+    {
+        return Error(ErrorCode::PackageMountInvalid, "Encrypted image layer is missing required JWE authorization block");
+    }
+
+    return details;
+}
+
+Result<OCIPackage::CryptoVerityAnnotations>
+OCIPackage::getCryptoVerityAnnotations(const std::shared_ptr<const OCIDescriptor> &descriptor)
+{
+    CryptoVerityAnnotations details;
+
+    auto verityResult = OCIPackage::getDmVerityAnnotations(descriptor);
+    if (!verityResult)
+    {
+        return verityResult.error();
+    }
+    auto cryptoResult = OCIPackage::getCryptoAnnotations(descriptor);
+    if (!cryptoResult)
+    {
+        return cryptoResult.error();
+    }
+
+    details.verity = std::move(verityResult.value());
+    details.crypto = std::move(cryptoResult.value());
+    return details;
+}
+
 // -------------------------------------------------------------------------
 /*!
     For OCI package we try and support mounting the package contents if the
@@ -1046,17 +1113,10 @@ OCIPackage::getDmVerityAnnotations(const std::shared_ptr<const OCIDescriptor> &d
 Result<std::unique_ptr<IPackageMountImpl>> OCIPackage::mount(const std::filesystem::path &mountPoint, MountFlags flags)
 {
     // Check if the package is mountable, this is a simple check that the package is valid and has an image layer
-    // with the media type of PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_EROFS.
+    // with the media type of PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_EROFS or PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_EROFS_ENCRYPTED.
     if (!isMountable())
     {
         return Error(ErrorCode::PackageMountInvalid, "Package is not mountable");
-    }
-
-    // Check we have a mounter interface, we won't on non-linux platforms
-    if (!m_dmVerityMounter)
-    {
-        return Error(ErrorCode::NotSupported, "Library doesn't support mounting packages on this platform, "
-                                              "or library built without mount support enabled");
     }
 
     // Although not strictly required, we expect the package metadata to have been parsed (and signature checked) before
@@ -1073,7 +1133,77 @@ Result<std::unique_ptr<IPackageMountImpl>> OCIPackage::mount(const std::filesyst
         return Error(ErrorCode::PackageMountInvalid, "Mount point is not an existing directory");
     }
 
-    // Get (and check) the dm-verity annotations from the image descriptor
+    // Parse the media type first so the code can split the plain dm-verity path from the dedicated encrypted/LUKS2 path.
+    const auto mediaType = m_packageImageDescriptor->mediaType();
+    const bool encrypted = (mediaType == PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_EROFS_ENCRYPTED);
+
+    if (encrypted)
+    {
+        logInfo("mounting encrypted package");
+        // This path intentionally stays separate from the existing dm-verity mount path. It is the entry point for the
+        // LUKS2-over-dm-verity layout, where the EROFS payload is wrapped inside the LUKS2 container and should be
+        // mounted by the dedicated LUKS2/mapped-device handler rather than by the plain dm-verity loopback mount logic.
+        if (!m_luksMounter)
+        {
+            return Error(ErrorCode::NotSupported,
+                         "Library doesn't support mounting encrypted packages on this platform, or library built without encrypted mount support enabled");
+        }
+
+        auto cryptoVerityAnnotations = getCryptoVerityAnnotations(m_packageImageDescriptor);
+        if (!cryptoVerityAnnotations)
+        {
+            logError("cannot get crypto annotations");
+            return cryptoVerityAnnotations.error();
+        }
+
+        static const std::filesystem::path blobsPath = "blobs/sha256";
+        auto imagePath = blobsPath / m_packageImageDescriptor->digest();
+        logInfo("Encrypted package at: %s", imagePath.c_str());
+        auto result = m_backingStore->getMappableFile(imagePath);
+        if (!result)
+        {
+            logError("Encrypted package at: %s not mappable", imagePath.c_str());
+            return Error::format(ErrorCode::PackageMountInvalid, "Encrypted package image layer is not mountable due to %s",
+                                 result.error().what());
+        }
+
+        auto mountableBlob = std::move(result.value());
+        if (!mountableBlob->isAligned())
+        {
+            logError("Encrypted package at: %s not aligned", imagePath.c_str());
+            return Error::format(ErrorCode::PackageContentsInvalid,
+                                 "Encrypted package image layer entry is not aligned, cannot mount");
+        }
+
+        // The encrypted path is now validated by the dedicated LUKS mounter itself, rather than by adapting the
+        // dm-verity mounter interface to a second meaning.
+        logInfo("mountable blob spanning vector in zip: %" PRIu64 " %" PRIu64 "", mountableBlob->offset(), mountableBlob->size());
+        const ILuksMounter::FileRange completeLuksRange = { mountableBlob->offset(), mountableBlob->size()};
+        const ILuksMounter::FileRange hashRange = {cryptoVerityAnnotations->verity.hashesOffset, 0}; // size - we will calculate that in mount after having decrypted mount
+        // TODO: some checkImageFile
+        auto startTime = std::chrono::steady_clock::now();
+        auto mount = m_luksMounter->mount(metaDataPtr->id(), ILuksMounter::FileSystemType::Erofs,
+                                          mountableBlob->fd(), mountPoint, completeLuksRange, hashRange,
+                                          cryptoVerityAnnotations->verity.rootHash,
+                                          cryptoVerityAnnotations->verity.salt,
+                                          cryptoVerityAnnotations->crypto.jwe, flags);
+        auto endTime = std::chrono::steady_clock::now();
+        auto durationMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
+        // keep printf to see that unconditionally
+        printf("PERF: Total mounting package '%s' took %.2f ms (status: %s)\n", metaDataPtr->id().c_str(), durationMs, mount ? "SUCCESS" : "FAILED");
+
+        return mount;
+}
+
+    logInfo("mounting clear package");
+    // Check we have a mounter interface, we won't on non-linux platforms
+    if (!m_dmVerityMounter)
+    {
+        return Error(ErrorCode::NotSupported, "Library doesn't support mounting packages on this platform, "
+                                              "or library built without mount support enabled");
+    }
+
+    // Existing plain dm-verity path stays intact and continues to mount the original EROFS+dm-verity layout.
     auto annotations = getDmVerityAnnotations(m_packageImageDescriptor);
     if (!annotations)
     {
@@ -1231,7 +1361,9 @@ std::unique_ptr<IPackageReaderImpl> OCIPackage::createReader(Error *_Nullable er
         return nullptr;
     }
 
-    // Check the mediaType in the package image descriptor, this determines the type of image reader to create
+    // Check the mediaType in the package image descriptor, this determines the type of image reader to create.
+    // The plain EROFS+dm-verity path uses the read-through dm-verity reader, while the encrypted media type is
+    // intentionally not routed through this reader because it must be handled by the dedicated LUKS2 mount path.
     const std::string &mediaType = m_packageImageDescriptor->mediaType();
     if (mediaType == PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_EROFS)
     {
@@ -1267,6 +1399,16 @@ std::unique_ptr<IPackageReaderImpl> OCIPackage::createReader(Error *_Nullable er
         // checks on all the data read from the image.
         return std::make_unique<OCIErofsImageLayerReader>(mountableBlob.value(), annotations->hashesOffset,
                                                           annotations->rootHash);
+    }
+    else if (mediaType == PACKAGE_IMAGE_MEDIA_TYPE_PACKAGE_CONTENT_EROFS_ENCRYPTED)
+    {
+        if (error)
+        {
+            *error = Error(ErrorCode::NotSupported,
+                           "Encrypted EROFS layer requires the dedicated LUKS2 mount path and cannot be read by the dm-verity image reader");
+        }
+
+        return nullptr;
     }
     else if (mediaType.find(PACKAGE_IMAGE_MEDIA_TYPE_PREFIX) == 0)
     {
