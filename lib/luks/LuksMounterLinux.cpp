@@ -190,8 +190,10 @@ Result<void> LuksMounterLinux::luksActivate(const std::string& loopDevPath,
 
     // Activate block device with 512bits passphrase
     // set CRYPT_ACTIVATE_READONLY, to grant lack of modification of OCI files
-    r = crypt_activate_by_passphrase(cd, luksVolumeName.c_str(), CRYPT_ANY_SLOT, 
-                                     reinterpret_cast<const char*>(raw512BitKey.data()), 
+    //r = crypt_activate_by_passphrase(cd, luksVolumeName.c_str(), CRYPT_ANY_SLOT, 
+    //                                 reinterpret_cast<const char*>(raw512BitKey.data()), 
+    //                                 raw512BitKey.size(), CRYPT_ACTIVATE_READONLY);
+    r = crypt_activate_by_volume_key(cd, luksVolumeName.c_str(), reinterpret_cast<const char*>(raw512BitKey.data()), 
                                      raw512BitKey.size(), CRYPT_ACTIVATE_READONLY);
     if (r < 0)
     {
@@ -275,7 +277,7 @@ LuksMounterLinux::doMount(std::string_view name, FileSystemType fsType, int imag
     auto startTimeUnwrap = std::chrono::steady_clock::now();
     // Unwrap the key - assume hardcoded location of /media/mass_storage/recipient_private.jwk
     std::string dynamicPath = "/media/mass_storage/recipient_private.jwk";
-    std::string fallbackPath = "/home/mikolaj.staworzynski/projects/LGI/BOLT_ENCRYPTION/bash_pc/from_bolt_tool_bolts/intermediate_files/recipient_private.jwk";
+    std::string fallbackPath = "/home/mikolaj.staworzynski/projects/LGI/BOLT_ENCRYPTION/master_key_build/example/intermediate_files/recipient_private.jwk";
     std::string chosenPath = std::filesystem::exists(dynamicPath) ? dynamicPath : fallbackPath;
     logInfo("jwk private to unwrap the key: %s", chosenPath.c_str());
     auto unwrapResult = unwrapKeyMaterial(wrappedKey, chosenPath);
