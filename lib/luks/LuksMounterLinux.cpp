@@ -11,8 +11,12 @@
 #include <unistd.h>
 #include <sys/sysmacros.h>
 #include <sys/time.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 #include <cinttypes>
 #include <chrono>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -30,9 +34,26 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <openssl/crypto.h>
+#include <openssl/sha.h>
 #include "dm-verity/DmVerityUtils.h"
 #include <iostream>
 #include <uuid/uuid.h>
+// keyutils.h on some platforms uses 'private' as a parameter name (C++ keyword)
+// example
+// include/keyutils.h:221:48: error: expected ',' or '...' before 'private'
+//  221 | extern long keyctl_dh_compute_kdf(key_serial_t private, key_serial_t prime,
+//      |                                                ^~~~~~~
+
+extern "C" {
+#define private private_
+#include <keyutils.h>
+#undef private
+}
+// libjose headers have no extern "C" guards of their own
+extern "C" {
+#include <jose/jose.h>
+}
+#include <jansson.h>
 
 #if defined(LIBRALF_NS)
 using namespace LIBRALF_NS;
@@ -44,6 +65,90 @@ using namespace entos::ralf::dmverity;
 static const std::map<ILuksMounter::FileSystemType, const char *> kFileSystemTypeNames = {
     { ILuksMounter::FileSystemType::Erofs, "erofs" },
 };
+
+static const char* CACHE_KEY_DESC_PREFIX = "ralf:cached:masterkey:";
+static const size_t EXPECTED_KEY_SIZE = 64; // 512 bits for AES-XTS-512
+
+// "logon" keys cannot be read back by userspace; dm-crypt resolves the key
+// reference in-kernel (key service), so the payload never leaves the kernel.
+static const char* CACHE_KEY_TYPE = "logon";
+
+// Keyring holding the cached master key.
+// Session keyring: shared by all processes in the login session, survives process restarts.
+//static const key_serial_t CACHE_KEYRING = KEY_SPEC_SESSION_KEYRING;
+// Process keyring alternative: private to the calling process, dropped when it exits.
+static const key_serial_t CACHE_KEYRING = KEY_SPEC_PROCESS_KEYRING;
+
+// Cache entry description is derived from the wrapped key, so a key cached
+// for one wrappedKey is never used for a different one.
+static std::string cacheKeyDescFor(const std::vector<uint8_t>& wrappedKey) {
+    std::array<uint8_t, SHA256_DIGEST_LENGTH> digest;
+    SHA256(wrappedKey.data(), wrappedKey.size(), digest.data());
+    return std::string(CACHE_KEY_DESC_PREFIX) + DmVerityUtils::bytesToHexString(digest.data(), digest.size());
+}
+
+// Wipe key material from RAM as soon as it is no longer needed.
+// Order matters: cleanse while the pages are still mlock'ed, so the wiped
+// (not the plaintext) content is what could ever reach swap afterwards.
+static void secureWipe(std::vector<uint8_t>& buf) {
+    if (!buf.empty()) {
+        OPENSSL_cleanse(buf.data(), buf.size());
+        munlock(buf.data(), buf.size());
+        buf.clear();
+    }
+}
+
+// RAII guard: while plaintext key material lives in this process, make it
+// non-dumpable and disable core files, so a crash cannot write the key to
+// disk. PR_SET_DUMPABLE=0 additionally blocks ptrace and /proc/<pid>/mem
+// access from same-UID processes. Previous state is restored on destruction.
+class CoreDumpGuard {
+public:
+    CoreDumpGuard() {
+        dumpable_ = prctl(PR_GET_DUMPABLE);
+        if (dumpable_ != 0) {
+            prctl(PR_SET_DUMPABLE, 0);
+        }
+        if (getrlimit(RLIMIT_CORE, &savedCoreLimit_) == 0) {
+            const struct rlimit noCore = {0, 0};
+            coreLimitSaved_ = (setrlimit(RLIMIT_CORE, &noCore) == 0);
+        }
+    }
+    ~CoreDumpGuard() {
+        if (coreLimitSaved_) {
+            setrlimit(RLIMIT_CORE, &savedCoreLimit_);
+        }
+        if (dumpable_ > 0) {
+            prctl(PR_SET_DUMPABLE, dumpable_);
+        }
+    }
+    CoreDumpGuard(const CoreDumpGuard&) = delete;
+    CoreDumpGuard& operator=(const CoreDumpGuard&) = delete;
+private:
+    int dumpable_ = -1;
+    struct rlimit savedCoreLimit_ = {};
+    bool coreLimitSaved_ = false;
+};
+
+bool LuksMounterLinux::isMasterKeyInCache(const std::string& keyDesc) {
+    logInfo("Looking up master key in cache: %s", keyDesc.c_str());
+    key_serial_t key_id = request_key(CACHE_KEY_TYPE, keyDesc.c_str(), nullptr, CACHE_KEYRING);
+    logInfo("Master key cache %s: %s", key_id == -1 ? "miss" : "hit", keyDesc.c_str());
+    return key_id != -1;
+}
+
+bool LuksMounterLinux::saveMasterKeyToCache(const std::vector<uint8_t>& wrappedKey, const std::vector<uint8_t>& key) {
+    const std::string keyDesc = cacheKeyDescFor(wrappedKey);
+    logInfo("Saving master key to cache: %s", keyDesc.c_str());
+    key_serial_t key_id = add_key(
+        CACHE_KEY_TYPE,
+        keyDesc.c_str(),
+        key.data(),
+        key.size(),
+        CACHE_KEYRING
+    );
+    return (key_id != -1);
+}
 
 // utility to unwrap the key - now use the static file, jose tool, and wrappedKey value  - require final hardening, but it is a POC
 Result<std::vector<uint8_t>> LuksMounterLinux::unwrapKeyMaterial(
@@ -142,6 +247,8 @@ Result<std::vector<uint8_t>> LuksMounterLinux::unwrapKeyMaterial(
         decryptedBytes.insert(decryptedBytes.end(), buffer, buffer + bytes_read);
     }
     close(pipe_out[0]);
+    // the stack buffer still holds the tail of the key material
+    OPENSSL_cleanse(buffer, sizeof(buffer));
 
     // Wait for finish
     int status = 0;
@@ -150,6 +257,7 @@ Result<std::vector<uint8_t>> LuksMounterLinux::unwrapKeyMaterial(
     // Check if finished
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || decryptedBytes.empty())
     {
+        secureWipe(decryptedBytes);
         return make_error();
     }
 
@@ -157,12 +265,11 @@ Result<std::vector<uint8_t>> LuksMounterLinux::unwrapKeyMaterial(
     return Result<std::vector<uint8_t>>(std::move(decryptedBytes));
 }
 
-Result<void> LuksMounterLinux::luksActivate(const std::string& loopDevPath, 
-                                            const std::string& luksVolumeName, 
-                                            const std::vector<uint8_t>& raw512BitKey)
-{
-    logInfo("luksActivate looper: %s volume: %s keySizeInBytes: %ld", loopDevPath.c_str(), luksVolumeName.c_str(), raw512BitKey.size());
+using CryptDevicePtr = std::unique_ptr<struct crypt_device, void(*)(struct crypt_device*)>;
 
+// crypt_init + crypt_load: LUKS2 header parsing (libcryptsetup is used only for this)
+static Result<CryptDevicePtr> initAndLoadLuksDevice(const std::string& loopDevPath)
+{
     struct crypt_device *cd = nullptr;
     // initialization of libcrypt for pointed loopback
     int r = crypt_init(&cd, loopDevPath.c_str());
@@ -174,7 +281,7 @@ Result<void> LuksMounterLinux::luksActivate(const std::string& loopDevPath,
     logInfo("luksActivate: crypt_init: ok on: %s", loopDevPath.c_str());
 
     // safe smart pointer to release the memory after crypt_init
-    std::unique_ptr<struct crypt_device, void(*)(struct crypt_device*)> cdPtr(cd, [](struct crypt_device* c)
+    CryptDevicePtr cdPtr(cd, [](struct crypt_device* c)
     {
         if (c) crypt_free(c);
     });
@@ -188,21 +295,73 @@ Result<void> LuksMounterLinux::luksActivate(const std::string& loopDevPath,
     }
     logInfo("luksActivate: crypt_load: ok");
 
-    // Activate block device with 512bits passphrase
-    // set CRYPT_ACTIVATE_READONLY, to grant lack of modification of OCI files
-    //r = crypt_activate_by_passphrase(cd, luksVolumeName.c_str(), CRYPT_ANY_SLOT, 
-    //                                 reinterpret_cast<const char*>(raw512BitKey.data()), 
-    //                                 raw512BitKey.size(), CRYPT_ACTIVATE_READONLY);
-    r = crypt_activate_by_volume_key(cd, luksVolumeName.c_str(), reinterpret_cast<const char*>(raw512BitKey.data()), 
-                                     raw512BitKey.size(), CRYPT_ACTIVATE_READONLY);
-    if (r < 0)
-    {
-        logError("libcryptsetup: Cryptographic authentication failed for %s. Invalid key material (code: %d)", luksVolumeName.c_str(), r);
-        return Error::format(ErrorCode::DmVerityError, "libcryptsetup: Cryptographic authentication failed for %s. Invalid key material (code: %d)", luksVolumeName.c_str(), r);
-    }
-    logInfo("luksActivate: crypt_activate_by_passphrase: ok on: %s", luksVolumeName.c_str());
+    return Result<CryptDevicePtr>(std::move(cdPtr));
+}
 
-    return Ok();
+static bool getDeviceOrFileSize(int fd, uint64_t &size);
+
+// Activate the LUKS volume with dm-crypt referencing the volume key from the
+// kernel keyring (key service ":<size>:<type>:<description>") - the kernel
+// resolves the key itself, so the payload never enters this process at all.
+// libcryptsetup is used only to parse the LUKS2 header.
+// Returns the device node of the decrypted dm-crypt device.
+Result<std::filesystem::path> LuksMounterLinux::luksActivateFromKeyring(const std::string& loopDevPath,
+                                                       const std::string& luksVolumeName,
+                                                       const std::string& keyDesc,
+                                                       bool useUDevSync)
+{
+    logInfo("luksActivateFromKeyring looper: %s volume: %s key: %s", loopDevPath.c_str(), luksVolumeName.c_str(), keyDesc.c_str());
+
+    auto cdPtrResult = initAndLoadLuksDevice(loopDevPath);
+    if (!cdPtrResult)
+    {
+        return cdPtrResult.error();
+    }
+    struct crypt_device *cd = cdPtrResult.value().get();
+
+    // Read the LUKS2 segment/cipher parameters needed to build the dm-crypt table
+    const char* cipher = crypt_get_cipher(cd);
+    const char* cipherMode = crypt_get_cipher_mode(cd);
+    const int keySize = crypt_get_volume_key_size(cd);
+    const int sectorSize = crypt_get_sector_size(cd);
+    if (!cipher || !cipherMode || keySize <= 0 || sectorSize <= 0)
+    {
+        return Error::format(ErrorCode::DmVerityError, "libcryptsetup: Failed to read cipher info for %s", loopDevPath.c_str());
+    }
+    const std::string cipherSpec = std::string(cipher) + "-" + cipherMode;
+    const uint64_t dataOffset = crypt_get_data_offset(cd); // in 512-byte sectors
+    const uint64_t ivOffset = crypt_get_iv_offset(cd);
+
+    logInfo("LUKS geometry: cipher=%s mode=%s keySize=%dB sectorSize=%dB dataOffset=%" PRIu64 " (512B sectors) ivOffset=%" PRIu64,
+            cipher, cipherMode, keySize, sectorSize, dataOffset, ivOffset);
+
+    // Size of the whole underlying device - the mapped area starts after the LUKS header
+    int loopFd = open(loopDevPath.c_str(), O_RDONLY | O_CLOEXEC);
+    if (loopFd < 0)
+    {
+        return Error::format(std::error_code(errno, std::system_category()), "Failed to open %s", loopDevPath.c_str());
+    }
+    uint64_t deviceSize = 0;
+    const bool sizeOk = getDeviceOrFileSize(loopFd, deviceSize);
+    close(loopFd);
+    if (!sizeOk)
+    {
+        return Error::format(ErrorCode::DmVerityError, "Failed to get size of %s", loopDevPath.c_str());
+    }
+    logInfo("LUKS geometry: device=%s deviceSize=%" PRIu64 " B (%" PRIu64 " sectors) mappedSize=%" PRIu64 " B",
+            loopDevPath.c_str(), deviceSize, deviceSize / 512, deviceSize - dataOffset * 512);
+
+    DevMapper devMapper;
+    auto mappedPath = devMapper.mapWithCrypt(loopDevPath, luksVolumeName, "", deviceSize, cipherSpec,
+                                             CACHE_KEY_TYPE, keyDesc, static_cast<size_t>(keySize),
+                                             ivOffset, dataOffset, static_cast<uint32_t>(sectorSize), useUDevSync);
+    if (!mappedPath)
+    {
+        return mappedPath.error();
+    }
+    logInfo("luksActivateFromKeyring: ok on: %s (%s)", luksVolumeName.c_str(), mappedPath.value().c_str());
+
+    return mappedPath;
 }
 
 static std::string generateUUID() {
@@ -279,29 +438,65 @@ LuksMounterLinux::doMount(std::string_view name, FileSystemType fsType, int imag
     std::string dynamicPath = "/media/mass_storage/recipient_private.jwk";
     std::string fallbackPath = "/home/mikolaj.staworzynski/projects/LGI/BOLT_ENCRYPTION/master_key_build/example/intermediate_files/recipient_private.jwk";
     std::string chosenPath = std::filesystem::exists(dynamicPath) ? dynamicPath : fallbackPath;
-    logInfo("jwk private to unwrap the key: %s", chosenPath.c_str());
-    auto unwrapResult = unwrapKeyMaterial(wrappedKey, chosenPath);
-    if (unwrapResult.value().empty())
+    const std::string keyDesc = cacheKeyDescFor(wrappedKey);
+    // The volume is activated with the key referenced from the kernel keyring
+    // (dm-crypt key service) - the key payload never enters this process.
+    std::vector<uint8_t> unwrappedKey;
     {
-        logError("Failed to unwrap AES key material via jose CLI");
-        close(loopDevFd.value());
-        return Error(ErrorCode::DmVerityError, "Failed to unwrap AES key material via jose CLI");
+        // Plaintext key material lives in this process only within this scope:
+        // core dumps and same-UID ptrace//proc inspection stay disabled until
+        // the guard is destroyed, i.e. strictly after secureWipe() below.
+        CoreDumpGuard coreGuard;
+
+        const bool keyInCache = isMasterKeyInCache(keyDesc);
+        if (!keyInCache)
+        {
+            logInfo("Master key not found in cache, unwrapping from JWK");
+            auto unwrapResult = unwrapKeyMaterial(wrappedKey, chosenPath);
+            if (!unwrapResult)
+            {
+                logError("Failed to unwrap AES key material via jose CLI");
+                close(loopDevFd.value());
+                return unwrapResult.error();
+            }
+            unwrappedKey = std::move(unwrapResult.value());
+            if (unwrappedKey.size() != EXPECTED_KEY_SIZE)
+            {
+                logError("Unwrapped key size is incorrect: expected %zu bytes, got %zu bytes", EXPECTED_KEY_SIZE, unwrappedKey.size());
+                secureWipe(unwrappedKey);
+                close(loopDevFd.value());
+                return Error(ErrorCode::DmVerityError, "Unwrapped key size is incorrect");
+            }
+            // Save the unwrapped key to cache for future use
+            if (!saveMasterKeyToCache(wrappedKey, unwrappedKey))
+            {
+                logWarning("Failed to save master key to cache");
+            }
+            else
+            {
+                logInfo("Master key saved to cache");
+            }
+        }
+        else
+        {
+            logInfo("Master key found in cache (stays in kernel keyring)");
+        }
+        auto endTimeUnwrap = std::chrono::steady_clock::now();
+        auto durationMsUnwrap = std::chrono::duration<double, std::milli>(endTimeUnwrap - startTimeUnwrap).count();
+        printf("PERF: Key unwrap/get took %.2f ms\n", durationMsUnwrap);
+
+        // The kernel resolves the key from the keyring by itself - the RAM copy
+        // (only present right after a fresh unwrap) can go before the activation.
+        secureWipe(unwrappedKey);
     }
-    logInfo("Key unwrapped in RAM");
-    auto endTimeUnwrap = std::chrono::steady_clock::now();
-    auto durationMsUnwrap = std::chrono::duration<double, std::milli>(endTimeUnwrap - startTimeUnwrap).count();
-    printf("PERF: Key unwrap took %.2f ms\n", durationMsUnwrap);
 
     // LUKS container activation
     std::string randomUuid = generateUUID();
     std::string luksVolumeName = std::string(name) + "_" + randomUuid + "_crypt";
     logInfo("LUKS volume name: %s", luksVolumeName.c_str());
-    auto luksResult = luksActivate(loopDevPath, luksVolumeName, unwrapResult.value());
 
-    // Cleanup key value in RAM
-    OPENSSL_cleanse(unwrapResult.value().data(), unwrapResult.value().size());
-    unwrapResult.value().clear();
-    logInfo("Key clean in RAM");
+    auto luksResult = luksActivateFromKeyring(loopDevPath, luksVolumeName, keyDesc,
+                                              (flags & MountFlag::UDevSync) == MountFlag::UDevSync);
 
     // We could close looper, kernel holds the mapping
     if (close(loopDevFd.value()) != 0)
@@ -314,14 +509,15 @@ LuksMounterLinux::doMount(std::string_view name, FileSystemType fsType, int imag
         logError("Failed to mount LUKS");
         return luksResult.error();
     }
-    logInfo("LUKS volume mounted in: %s", luksVolumeName.c_str());
+    // Use the device node found by the devmapper - nothing guarantees /dev/mapper/<name> exists
+    const std::string luksMappedPath = luksResult.value().string();
+    logInfo("LUKS volume mounted in: %s (%s)", luksVolumeName.c_str(), luksMappedPath.c_str());
     auto endTime = std::chrono::steady_clock::now();
     auto durationMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
     printf("PERF: LUKS part (with unwrap) took %.2f ms\n", durationMs);
 
     startTime = std::chrono::steady_clock::now();
     // Open unencrypted device and prepare verity
-    std::string luksMappedPath = "/dev/mapper/" + luksVolumeName;
     int decryptedFd = open(luksMappedPath.c_str(), O_RDONLY);
     if (decryptedFd < 0)
     {
@@ -436,7 +632,7 @@ LuksMounterLinux::doMount(std::string_view name, FileSystemType fsType, int imag
 
     // Check status of the device
     auto dmStatus = devMapper.mapStatus(volumeName, volumeUuid);
-    if (!dmStatus || (dmStatus.value() != "V"))
+    if (!dmStatus || dmStatus.value().empty() || dmStatus.value().rfind("V", 0) != 0)
     {
         logError("Detected corruption in crypt-verity image block layout");
         ::umount2(mountPoint.c_str(), MNT_FORCE);
@@ -467,23 +663,20 @@ LuksMounterLinux::doMount(std::string_view name, FileSystemType fsType, int imag
 
         if (autoClear)
         {
-            struct crypt_device *cd = nullptr;
-            if (crypt_init_by_name(&cd, luksVolumeName.c_str()) == 0)
+            // Mark the dm-crypt (LUKS) device for deferred removal too - it is held
+            // open by the verity device on top, so it disappears automatically
+            // once the verity mapping above it is gone.  Done via devmapper
+            // directly: the device was not created by cryptsetup, so
+            // crypt_init_by_name/crypt_deactivate_by_name cannot be used on it.
+            if (!devMapper.unmap(luksVolumeName, "", true)) // true = deferred
             {
-                if (crypt_deactivate_by_name(cd, luksVolumeName.c_str(), CRYPT_DEACTIVATE_DEFERRED) != 0)
-                {
-                    autoClear = false;
-                }
-                else 
-                {
-                    logInfo("Deferred unmap armed for LUKS: %s", luksVolumeName.c_str());
-                }
-                crypt_free(cd);
-           }
-           else
-           {
+                logError("Failed to arm deferred unmap for LUKS volume: %s", luksVolumeName.c_str());
                 autoClear = false;
-           }
+            }
+            else
+            {
+                logInfo("Deferred unmap armed for LUKS: %s", luksVolumeName.c_str());
+            }
         }
     }
 

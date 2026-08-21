@@ -70,6 +70,13 @@ namespace entos::ralf::dmverity
                                                                 const std::vector<uint8_t> &rootHash,
                                                                 bool useUDevSync) const;
 
+        LIBRALF_NS::Result<std::filesystem::path> mapWithCrypt(std::string_view devicePath, std::string_view name,
+                                                               std::string_view uuid, uint64_t deviceSize,
+                                                               const std::string &cipher, const std::string &keyType,
+                                                               const std::string &keyDescription, size_t keySize,
+                                                               uint64_t ivOffset, uint64_t dataOffset,
+                                                               uint32_t sectorSize, bool useUDevSync) const;
+
         LIBRALF_NS::Result<> unmap(std::string_view name, std::string_view uuid, bool deferred = false) const;
 
         LIBRALF_NS::Result<std::string> mapStatus(std::string_view name, std::string_view uuid) const;

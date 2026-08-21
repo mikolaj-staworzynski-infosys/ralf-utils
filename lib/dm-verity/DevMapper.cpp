@@ -640,6 +640,64 @@ Result<std::filesystem::path> DevMapper::mapWithVerity(int devFd, std::string_vi
     return devNodePath;
 }
 
+Result<std::filesystem::path> DevMapper::mapWithCrypt(std::string_view devicePath, std::string_view name,
+                                                      std::string_view uuid, uint64_t deviceSize,
+                                                      const std::string &cipher, const std::string &keyType,
+                                                      const std::string &keyDescription, size_t keySize,
+                                                      uint64_t ivOffset, uint64_t dataOffset,
+                                                      uint32_t sectorSize, bool useUDevSync) const
+{
+    // Sanity check the devmapper is available
+    if (!isAvailable())
+        return Error(ErrorCode::DmVerityError, "Device mapper is not available");
+
+    // Check the device name and uuid fit within the limits of the device mapper
+    auto checkResult = checkDeviceNameAndUuid(name, uuid);
+    if (!checkResult)
+        return checkResult.error();
+
+    // The mapped device covers only the encrypted data area, i.e. the device minus the LUKS header
+    if (deviceSize <= dataOffset * 512)
+        return Error(ErrorCode::DmVerityError, "Invalid data offset for dm-crypt device");
+    const uint64_t mappedSize = deviceSize - dataOffset * 512;
+
+    // Build the dm-crypt target params:
+    //   <cipher> <key> <iv_offset> <device> <offset> [<#opt_params> <opt_params>]
+    // The key is a kernel key service reference (":<key_size>:<key_type>:<key_description>") -
+    // the kernel resolves it from the keyring itself, so the payload never enters userspace.
+    // See https://docs.kernel.org/admin-guide/device-mapper/dm-crypt.html
+    std::ostringstream params;
+    params << cipher << " :" << keySize << ':' << keyType << ':' << keyDescription << ' ' << ivOffset << ' '
+           << devicePath << ' ' << dataOffset;
+    if (sectorSize != 512)
+        params << " 1 sector_size:" << sectorSize;
+
+    logInfo("dm-crypt table: 0 %" PRIu64 " crypt %s", mappedSize / 512, params.str().c_str());
+
+    // Use devmapper to create the dm-crypt device on top of the loop device
+    auto createResult = createDevice(mappedSize, name, uuid, "crypt"sv, params.str(), true);
+    if (!createResult)
+        return createResult.error();
+
+    // Activate the device, this will return the major and minor numbers of the new device node
+    auto activateResult = activateDevice(name, uuid, true, useUDevSync);
+    if (!activateResult)
+    {
+        removeDevice(name, uuid, false);
+        return activateResult.error();
+    }
+
+    // Finally try and find the device node that has been created for the dm-crypt device.
+    auto devNodePath = findDeviceNode(activateResult.value());
+    if (!devNodePath)
+    {
+        removeDevice(name, uuid, false);
+        return devNodePath.error();
+    }
+
+    return devNodePath;
+}
+
 Result<> DevMapper::unmap(std::string_view name, std::string_view uuid, bool deferred) const
 {
     // Sanity check the devmapper is available
