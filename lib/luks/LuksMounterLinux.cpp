@@ -7,7 +7,6 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
 #include <sys/sysmacros.h>
 #include <sys/time.h>
@@ -150,7 +149,9 @@ bool LuksMounterLinux::saveMasterKeyToCache(const std::vector<uint8_t>& wrappedK
     return (key_id != -1);
 }
 
-// utility to unwrap the key - now use the static file, jose tool, and wrappedKey value  - require final hardening, but it is a POC
+// Unwrap the master key in-process with libjose: the wrappedKey is a compact JWE
+// (CEK wrapped with the recipient RSA key), decrypted with the private JWK.
+// Still uses a static jwk file - requires final hardening, but it is a POC
 Result<std::vector<uint8_t>> LuksMounterLinux::unwrapKeyMaterial(
     const std::vector<uint8_t>& wrappedKey, 
     const std::filesystem::path& jwkPath) 
@@ -165,103 +166,69 @@ Result<std::vector<uint8_t>> LuksMounterLinux::unwrapKeyMaterial(
         return make_error();
     }
 
-    int pipe_in[2];   // write to pipe_in[1] -> jose read from pipe_in[0]
-    int pipe_out[2];  // jose write to pipe_out[1] -> C++ read from pipe_out[0]
-
-    //make pipes
-    if (pipe(pipe_in) < 0)
+    // wrappedKey is a compact-serialized JWE (RFC 7516):
+    // BASE64URL(protected).BASE64URL(encrypted_key).BASE64URL(iv).BASE64URL(ciphertext).BASE64URL(tag)
+    const std::string compact(wrappedKey.begin(), wrappedKey.end());
+    std::array<std::string, 5> parts;
+    size_t begin = 0;
+    size_t partCount = 0;
+    for (size_t i = 0; i <= compact.size(); ++i)
     {
-        return make_error();
-    }
-    
-    if (pipe(pipe_out) < 0)
-    {
-        close(pipe_in[0]);
-        close(pipe_in[1]);
-        return make_error();
-    }
-
-    // forking for jose
-    pid_t pid = fork();
-    if (pid < 0)
-    {
-        close(pipe_in[0]);  close(pipe_in[1]);
-        close(pipe_out[0]); close(pipe_out[1]);
-        return make_error();
-    }
-
-    if (pid == 0)
-    {
-        
-        // redirect stdin to read from pipe
-        if (dup2(pipe_in[0], STDIN_FILENO) < 0) _exit(1);
-        
-        // redirect stdout) na write to pipe
-        if (dup2(pipe_out[1], STDOUT_FILENO) < 0) _exit(1);
-
-        // close not used
-        close(pipe_in[0]);  close(pipe_in[1]);
-        close(pipe_out[0]); close(pipe_out[1]);
-
-        // launch binary
-        execlp("/usr/bin/jose", "jose", "jwe", "dec", "-i-", "-k", jwkPath.c_str(), nullptr);
-        _exit(1);
-    }
-
-    // close pipes
-    close(pipe_in[0]);
-    close(pipe_out[1]);
-
-    // write jose token
-    size_t total_written = 0;
-    bool write_failed = false;
-    
-    while (total_written < wrappedKey.size())
-    {
-        ssize_t written = write(pipe_in[1], wrappedKey.data() + total_written, wrappedKey.size() - total_written);
-        if (written <= 0)
+        if (i == compact.size() || compact[i] == '.')
         {
-            write_failed = true;
-            break;
+            if (partCount >= parts.size() || i == begin)
+            {
+                logError("Malformed compact JWE in wrapped key");
+                return make_error();
+            }
+            parts[partCount++] = compact.substr(begin, i - begin);
+            begin = i + 1;
         }
-        total_written += written;
     }
-    
-    // close to signal the completeness of the token
-    close(pipe_in[1]); 
-
-    if (write_failed)
+    if (partCount != parts.size())
     {
-        close(pipe_out[0]);
-        waitpid(pid, nullptr, 0);
+        logError("Malformed compact JWE in wrapped key: expected 5 parts, got %zu", partCount);
         return make_error();
     }
 
-    // read output bin
-    std::vector<uint8_t> decryptedBytes;
-    char buffer[4096];
-    ssize_t bytes_read;
-    
-    while ((bytes_read = read(pipe_out[0], buffer, sizeof(buffer))) > 0)
+    // private recipient key (RSA JWK) used to unwrap the CEK
+    json_error_t jsonError = {};
+    json_t* jwk = json_load_file(jwkPath.c_str(), 0, &jsonError);
+    if (!jwk)
     {
-        decryptedBytes.insert(decryptedBytes.end(), buffer, buffer + bytes_read);
+        logError("Failed to load JWK from %s: %s", jwkPath.c_str(), jsonError.text);
+        return make_error();
     }
-    close(pipe_out[0]);
-    // the stack buffer still holds the tail of the key material
-    OPENSSL_cleanse(buffer, sizeof(buffer));
+    std::unique_ptr<json_t, decltype(&json_decref)> jwkPtr(jwk, &json_decref);
 
-    // Wait for finish
-    int status = 0;
-    waitpid(pid, &status, 0);
-
-    // Check if finished
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || decryptedBytes.empty())
+    // libjose operates on the flattened JSON serialization - convert from compact
+    json_t* jwe = json_pack("{s:s,s:s,s:s,s:s,s:s}",
+                            "protected", parts[0].c_str(),
+                            "encrypted_key", parts[1].c_str(),
+                            "iv", parts[2].c_str(),
+                            "ciphertext", parts[3].c_str(),
+                            "tag", parts[4].c_str());
+    if (!jwe)
     {
-        secureWipe(decryptedBytes);
+        logError("Failed to build JWE object from compact serialization");
+        return make_error();
+    }
+    std::unique_ptr<json_t, decltype(&json_decref)> jwePtr(jwe, &json_decref);
+
+    // unwrap the CEK and decrypt the payload in-process
+    size_t plainLen = 0;
+    void* plain = jose_jwe_dec(nullptr, jwe, nullptr, jwk, &plainLen);
+    if (!plain || plainLen == 0)
+    {
+        logError("libjose: JWE decryption failed");
         return make_error();
     }
 
-    // return the decrypted bytes
+    std::vector<uint8_t> decryptedBytes(static_cast<const uint8_t*>(plain),
+                                        static_cast<const uint8_t*>(plain) + plainLen);
+    OPENSSL_cleanse(plain, plainLen);
+    free(plain);
+
     return Result<std::vector<uint8_t>>(std::move(decryptedBytes));
 }
 

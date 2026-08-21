@@ -77,6 +77,8 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(CRYPTSETUP REQUIRED IMPORTED_TARGET libcryptsetup)
 pkg_check_modules(UUID REQUIRED IMPORTED_TARGET uuid)
 pkg_check_modules(KEYUTILS REQUIRED IMPORTED_TARGET libkeyutils)
+pkg_check_modules(JOSE REQUIRED IMPORTED_TARGET jose)
+pkg_check_modules(JANSSON REQUIRED IMPORTED_TARGET jansson)
 
 set(libralf_LIBDEPS
         LibXml2::LibXml2
@@ -87,6 +89,8 @@ set(libralf_LIBDEPS
         PkgConfig::CRYPTSETUP
         PkgConfig::UUID
         PkgConfig::KEYUTILS
+        PkgConfig::JOSE
+        PkgConfig::JANSSON
 )
 
 if (BUILD_SHARED_LIBS)
